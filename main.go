@@ -1,11 +1,16 @@
 package main
 
 import (
+	"crypto/tls"
 	"fmt"
 	"log"
 	"net/http"
+	"sync"
+	"time"
 
+	"github.com/SlyMarbo/rss"
 	"github.com/gilliek/go-opml/opml"
+	"github.com/gorilla/feeds"
 	"github.com/oleiade/lane"
 )
 
@@ -17,6 +22,47 @@ type Feed struct {
 	Title string
 	URL   string
 }
+
+var wg sync.WaitGroup
+var feed_list []Feed
+var fetched_count int = 0
+var transport = &http.Transport{
+	TLSClientConfig: &tls.Config{
+		InsecureSkipVerify: true,
+	},
+}
+var client = &http.Client{Transport: transport,
+	Timeout: time.Duration(10) * time.Second,
+}
+
+type ItemHeap []*feeds.Item
+var heap = &ItemHeap{}
+
+func (self ItemHeap) Len() int {
+	return len(self)
+}
+
+func (self ItemHeap) Less(i, j int) bool {
+	return self[i].Updated.After(self[j].Updated)
+}
+
+func (self ItemHeap) Swap(i, j int) {
+	self[i], self[j] = self[j], self[i]
+}
+
+func (self *ItemHeap) Push(x interface{}) {
+	item := x.(*feeds.Item)
+	*self = append(*self, item)
+}
+
+func (self *ItemHeap) Pop() interface{} {
+	old := *self
+	n := len(old)
+	item := old[n-1]
+	*self = old[0:n-1]
+	return item
+}
+
 
 func extract_feeds(doc *opml.OPML) []Feed {
 	var res []Feed
@@ -47,12 +93,34 @@ func extract_feeds(doc *opml.OPML) []Feed {
 	return res
 }
 
-func crawl(url string) {
-	fmt.Println("start fetching: ", url)
-	resp, err := http.Get(url)
+func crawl(url string, ch chan<- *feeds.Item) {
+	defer wg.Done()
+
+	feed, err := rss.FetchByClient(url, client)
+	fetched_count = fetched_count + 1
+	fmt.Println("start fetching: [", fetched_count, "/", len(feed_list), "]", url)
 	if err != nil {
-		fmt.Println(resp)
+		fmt.Println("error: ", url)
+		fmt.Println(err.Error())
+		return
 	}
+
+	fmt.Println("Done :", feed.Title)
+
+	for _, item := range feed.Items {
+		fmt.Println("Date: ", item.Date, "item: ", item.Title)
+		i := &feeds.Item{
+			Title:       item.Title,
+			Link:        &feeds.Link{Href: item.Link},
+			Description: item.Summary,
+			Id:          item.ID,
+			Updated:     item.Date,
+		}
+		heap.Push(i)
+	}
+
+	fmt.Println("Done")
+	return
 }
 
 func main() {
@@ -62,17 +130,24 @@ func main() {
 		log.Fatal(err)
 	}
 
-	queue := make(chan string)
+	feed_ch := make(chan *feeds.Item)
+	feed_list = extract_feeds(doc)
 
-	list := extract_feeds(doc)
-	for _, feed := range list {
+	for _, feed := range feed_list {
 		url := feed.URL
-		go func() {
-			queue <- url
-		}()
+		wg.Add(1)
+		go func(uri string, ch chan<- *feeds.Item) {
+			crawl(uri, ch)
+		}(url, feed_ch)
 	}
 
-	for uri := range queue {
-		go crawl(uri)
+	wg.Wait()
+
+	fmt.Println("LEN: ", heap.Len())
+
+	for heap.Len() > 0 {
+		i := heap.Pop()
+		f := i.(*feeds.Item)
+		fmt.Println(f.Updated, ";", f.Title)
 	}
 }
